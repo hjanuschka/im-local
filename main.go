@@ -2,16 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/disintegration/imaging"
@@ -34,20 +39,17 @@ type Face struct {
 
 // ImageProcessor handles all image processing operations
 type ImageProcessor struct {
-	config     Config
-	classifier *pigo.Pigo
-	facefinder []byte
-	segmenter  *segmenter
+	config       Config
+	classifier   *pigo.Pigo
+	facefinder   []byte
+	segmenter    *segmenter
+	sourceClient *http.Client
+	processSlots chan struct{}
+	storageMutex sync.Mutex
 }
 
 func NewImageProcessor(config Config) (*ImageProcessor, error) {
-	// An empty policy would deny every source, so fall back to the default.
-	if len(config.AllowedHosts) == 0 {
-		config.AllowedHosts = defaultAllowedHosts
-	}
-	if config.MaxImageBytes <= 0 {
-		config.MaxImageBytes = defaultMaxImageBytes
-	}
+	config = config.withDefaults()
 
 	// Create cache directory if it doesn't exist
 	if err := os.MkdirAll(config.CacheDirectory, 0755); err != nil {
@@ -66,12 +68,18 @@ func NewImageProcessor(config Config) (*ImageProcessor, error) {
 	}
 
 	processor := &ImageProcessor{
-		config:     config,
-		facefinder: facefinder,
-		segmenter:  newSegmenter(config.ModelDirectory),
+		config:       config,
+		facefinder:   facefinder,
+		segmenter:    newSegmenter(config.ModelDirectory),
+		processSlots: make(chan struct{}, config.MaxConcurrent),
 	}
 
 	// Initialize the classifier if we have the cascade file
+	processor.sourceClient = processor.newSourceHTTPClient()
+	if config.DemoMode {
+		processor.startDemoCleanup()
+	}
+
 	if len(facefinder) > 0 {
 		p := pigo.NewPigo()
 		classifier, err := p.Unpack(facefinder)
@@ -109,6 +117,14 @@ func (ip *ImageProcessor) RegisterRoutes(router gin.IRouter) {
 // HandleRequest processes the image according to the parameters in the URL
 func (ip *ImageProcessor) HandleRequest(c *gin.Context) {
 	started := time.Now()
+	if len(c.Request.URL.RawQuery) > ip.config.MaxQueryBytes {
+		c.JSON(http.StatusRequestURITooLong, gin.H{"error": "query string is too large"})
+		return
+	}
+	if !ip.acquireProcessing(c) {
+		return
+	}
+	defer ip.releaseProcessing()
 
 	// Parse URL parameters
 	imageURL := queryValue(c.Request, "url")
@@ -160,8 +176,14 @@ func (ip *ImageProcessor) HandleRequest(c *gin.Context) {
 		return
 	}
 
-	if err := writeCache(cachePath, encoded); err != nil {
-		log.Printf("Warning: failed to write cache file: %v", err)
+	ip.storageMutex.Lock()
+	cacheErr := pruneDirectory(ip.config.CacheDirectory, ip.config.CacheDuration, ip.config.CacheStorageBytes, int64(len(encoded)))
+	if cacheErr == nil {
+		cacheErr = writeCache(cachePath, encoded)
+	}
+	ip.storageMutex.Unlock()
+	if cacheErr != nil {
+		log.Printf("Warning: failed to write cache file: %v", cacheErr)
 	}
 	ip.serveImage(c, encoded, outputFormat, "MISS", started)
 }
@@ -342,9 +364,36 @@ func main() {
 
 	processor.RegisterRoutes(router)
 
-	// Start server
+	server := &http.Server{
+		Addr:              ":" + config.Port,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
+
 	log.Printf("Encoders: %s", encoderBackends())
-	log.Printf("Allowed source hosts: %s", strings.Join(config.AllowedHosts, ", "))
+	if len(config.AllowedHosts) == 0 {
+		log.Printf("Network source fetching is disabled")
+	} else {
+		log.Printf("Allowed source hosts: %s", strings.Join(config.AllowedHosts, ", "))
+	}
 	log.Printf("Starting server on port %s", config.Port)
-	router.Run(":" + config.Port)
+
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+		}
+	}()
+
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("Server failed: %v", err)
+	}
 }

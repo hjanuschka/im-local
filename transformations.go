@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,7 +10,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/disintegration/imaging"
 	"github.com/gin-gonic/gin"
@@ -137,7 +135,7 @@ func (item transformation) number(defaultValue float64, names ...string) float64
 		value = item.Value
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
 		return defaultValue
 	}
 	return parsed
@@ -184,14 +182,22 @@ func transformationQuery(request *http.Request) string {
 	return query
 }
 
+type processingState struct {
+	remaining int
+}
+
 func (ip *ImageProcessor) ProcessImage(img image.Image, c *gin.Context) (image.Image, error) {
 	items, err := parseTransformations(transformationQuery(c.Request))
 	if err != nil {
 		return nil, err
 	}
+	if err := ip.validateOutputImage(img); err != nil {
+		return nil, err
+	}
+	state := &processingState{remaining: ip.config.withDefaults().MaxTransformations}
 	processed := img
 	for _, item := range items {
-		processed, err = ip.applyTransformation(processed, item)
+		processed, err = ip.applyTransformation(processed, item, state)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", item.Name, err)
 		}
@@ -199,7 +205,25 @@ func (ip *ImageProcessor) ProcessImage(img image.Image, c *gin.Context) (image.I
 	return processed, nil
 }
 
-func (ip *ImageProcessor) applyTransformation(img image.Image, item transformation) (image.Image, error) {
+func (ip *ImageProcessor) applyTransformation(img image.Image, item transformation, state *processingState) (image.Image, error) {
+	if state.remaining <= 0 {
+		return nil, fmt.Errorf("transformation limit exceeded")
+	}
+	state.remaining--
+	if err := ip.validateTransformationGeometry(img, item); err != nil {
+		return nil, err
+	}
+	result, err := ip.applyTransformationUnchecked(img, item, state)
+	if err != nil {
+		return nil, err
+	}
+	if err := ip.validateOutputImage(result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (ip *ImageProcessor) applyTransformationUnchecked(img image.Image, item transformation, state *processingState) (image.Image, error) {
 	width, height := dimensions(item)
 	switch item.Name {
 	case "resize":
@@ -269,9 +293,9 @@ func (ip *ImageProcessor) applyTransformation(img image.Image, item transformati
 	case "goop":
 		return goop(img, item.number(0.5, "chaos")), nil
 	case "ifdimension":
-		return ip.ifDimension(img, item)
+		return ip.ifDimension(img, item, state)
 	case "iforientation":
-		return ip.ifOrientation(img, item)
+		return ip.ifOrientation(img, item, state)
 	case "append", "composite":
 		return ip.composeRemote(img, item)
 	default:
@@ -288,13 +312,13 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func (ip *ImageProcessor) applyNested(img image.Image, query string) (image.Image, error) {
+func (ip *ImageProcessor) applyNested(img image.Image, query string, state *processingState) (image.Image, error) {
 	items, err := parseTransformations(query)
 	if err != nil {
 		return nil, err
 	}
 	for _, item := range items {
-		img, err = ip.applyTransformation(img, item)
+		img, err = ip.applyTransformation(img, item, state)
 		if err != nil {
 			return nil, err
 		}
@@ -302,7 +326,7 @@ func (ip *ImageProcessor) applyNested(img image.Image, query string) (image.Imag
 	return img, nil
 }
 
-func (ip *ImageProcessor) ifDimension(img image.Image, item transformation) (image.Image, error) {
+func (ip *ImageProcessor) ifDimension(img image.Image, item transformation, state *processingState) (image.Image, error) {
 	actual := img.Bounds().Dx()
 	if normalizeName(item.arg("dimension")) == "height" {
 		actual = img.Bounds().Dy()
@@ -316,10 +340,10 @@ func (ip *ImageProcessor) ifDimension(img image.Image, item transformation) (ima
 	} else {
 		branch = firstNonEmpty(item.arg("equal"), branch)
 	}
-	return ip.applyNested(img, branch)
+	return ip.applyNested(img, branch, state)
 }
 
-func (ip *ImageProcessor) ifOrientation(img image.Image, item transformation) (image.Image, error) {
+func (ip *ImageProcessor) ifOrientation(img image.Image, item transformation, state *processingState) (image.Image, error) {
 	bounds := img.Bounds()
 	branch := item.arg("default")
 	switch {
@@ -330,7 +354,7 @@ func (ip *ImageProcessor) ifOrientation(img image.Image, item transformation) (i
 	default:
 		branch = firstNonEmpty(item.arg("square"), branch)
 	}
-	return ip.applyNested(img, branch)
+	return ip.applyNested(img, branch, state)
 }
 
 // faceCropTransformation serves both FaceCrop and SmartCrop; both crop around
@@ -344,13 +368,6 @@ func (ip *ImageProcessor) faceCropTransformation(img image.Image, item transform
 		item.number(defaultMinQuality, "minquality", "confidence"),
 		item.number(defaultFacePadding, "padding"),
 		normalizeName(item.arg("focus")) == "biggestface")
-}
-
-func newHTTPClient(insecure bool) *http.Client {
-	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure}},
-	}
 }
 
 func clamp(value, low, high float64) float64 {

@@ -275,7 +275,12 @@ func TestHandleRequestNegotiatesJXL(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	processor, err := NewImageProcessor(Config{CacheDirectory: t.TempDir(), CacheDuration: time.Hour})
+	processor, err := NewImageProcessor(Config{
+		CacheDirectory:       t.TempDir(),
+		CacheDuration:        time.Hour,
+		AllowedHosts:         []string{"127.0.0.1"},
+		AllowPrivateNetworks: true,
+	})
 	if err != nil {
 		t.Fatalf("NewImageProcessor: %v", err)
 	}
@@ -371,9 +376,12 @@ func newTestServer(t *testing.T) *httptest.Server {
 	gin.SetMode(gin.TestMode)
 
 	processor, err := NewImageProcessor(Config{
-		CacheDirectory:  t.TempDir(),
-		UploadDirectory: t.TempDir(),
-		CacheDuration:   time.Hour,
+		CacheDirectory:       t.TempDir(),
+		UploadDirectory:      t.TempDir(),
+		CacheDuration:        time.Hour,
+		AllowedHosts:         []string{"127.0.0.1"},
+		AllowPrivateNetworks: true,
+		UploadsEnabled:       true,
 	})
 	if err != nil {
 		t.Fatalf("NewImageProcessor: %v", err)
@@ -660,7 +668,8 @@ func TestPlaygroundSchemaUsesSupportedTransformations(t *testing.T) {
 			t.Errorf("%s: unparseable transformation name: %v", spec.Name, err)
 			continue
 		}
-		if _, err := processor.applyTransformation(source, items[0]); err != nil &&
+		state := &processingState{remaining: defaultMaxTransformations}
+		if _, err := processor.applyTransformation(source, items[0], state); err != nil &&
 			strings.Contains(err.Error(), "unsupported transformation") {
 			t.Errorf("%s is offered by the playground but not implemented", spec.Name)
 		}

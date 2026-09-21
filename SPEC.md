@@ -144,13 +144,21 @@ Gravity values: `Center`, `North`, `South`, `East`, `West`, `NorthEast`,
 
 ## 3. Source images
 
-`url` must use `http` or `https`, and its host must match `IM_ALLOWED_HOSTS`,
-which defaults to loopback only. At most `IM_MAX_IMAGE_BYTES` (64 MiB by
-default) is read from the origin. TLS certificates are verified unless
-`IM_INSECURE_TLS=true`. Supported input formats are JPEG, PNG, GIF, WebP, and
-JPEG XL.
+`url` must use `http` or `https`. Network sources are disabled when
+`IM_ALLOWED_HOSTS` is empty, which is the default. When enabled, the hostname
+must match that list and the path must match `IM_ALLOWED_PATH_PREFIXES` when the
+path list is non-empty. Credentials, unsafe path traversal, and non-standard
+public ports are rejected.
 
-`Composite` and `Append` fetch their overlay with the same rules.
+Every redirect is revalidated. DNS is resolved by the service, and connections
+are pinned to a checked address to prevent DNS rebinding. Loopback, private,
+link-local, multicast, and unspecified addresses are rejected unless
+`IM_ALLOW_PRIVATE_NETWORKS=true`.
+
+At most `IM_MAX_IMAGE_BYTES` (16 MiB by default) is read. DecodeConfig must
+report no more than 20 million pixels or 8192 pixels along either axis before a
+full decode occurs. Supported input formats are JPEG, PNG, GIF, WebP, and JPEG
+XL. `Composite` and `Append` fetch overlays with the same rules.
 
 ---
 
@@ -288,32 +296,50 @@ All settings come from the environment.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `IM_PORT` | `8080` | Listen port. |
-| `IM_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Permitted source hosts. `*` allows everything, `*.example.com` matches subdomains. |
+| `IM_ALLOWED_HOSTS` | empty | Permitted source hosts; empty denies all. |
+| `IM_ALLOWED_PATH_PREFIXES` | empty | Optional source-path allowlist. |
+| `IM_ALLOW_PRIVATE_NETWORKS` | `false` | Allow private/non-routable addresses and non-standard ports. |
+| `IM_INSECURE_TLS` | `false` | Skip source TLS verification. |
+| `IM_MAX_IMAGE_BYTES` | `16777216` | Maximum compressed source bytes. |
+| `IM_MAX_IMAGE_PIXELS` | `20000000` | Maximum decoded source pixels. |
+| `IM_MAX_OUTPUT_PIXELS` | `25000000` | Maximum derivative pixels. |
+| `IM_MAX_DIMENSION` | `8192` | Maximum width or height. |
+| `IM_MAX_TRANSFORMATIONS` | `20` | Maximum operations including nested branches. |
+| `IM_MAX_QUERY_BYTES` | `16384` | Maximum raw query bytes. |
+| `IM_MAX_CONCURRENT` | `4` | Processing slots per process. |
+| `IM_QUEUE_TIMEOUT` | `5s` | Wait before an excess request returns 503. |
+| `IM_UPLOADS_ENABLED` | `false` | Enable uploads. |
+| `IM_UPLOAD_TOKEN` | empty | Optional bearer token for uploads. |
+| `IM_MAX_UPLOAD_BYTES` | `10485760` | Maximum compressed upload bytes. |
+| `IM_UPLOAD_STORAGE_BYTES` | `536870912` | Upload quota. Oldest files are removed first. |
+| `IM_UPLOAD_TTL` | `1h` | Upload lifetime. |
+| `IM_CACHE_STORAGE_BYTES` | `5368709120` | Derivative-cache quota. |
 | `IM_CACHE_DIR` | `./cache` | Derivative cache. |
 | `IM_MODEL_DIR` | `./models` | Segmentation weights. |
-| `IM_UPLOAD_DIR` | `./uploads` | Uploaded pristine images. |
+| `IM_UPLOAD_DIR` | `./uploads` | Uploaded images. |
 | `IM_CACHE_TTL` | `24h` | Cache lifetime. |
-| `IM_MAX_IMAGE_BYTES` | `67108864` | Maximum bytes read from an origin. |
-| `IM_INSECURE_TLS` | `false` | Skip TLS verification for source fetches. |
+| `DEMO_MODE` | `false` | Clean cache/upload artifacts older than 90 minutes every 90 minutes. |
 | `ONNXRUNTIME_SHARED_LIBRARY` | searched | onnxruntime library path. |
 | `IM_SEGMENTATION_DOWNLOAD` | `1` | `0` disables model downloads. |
-| `IM_SEGMENTATION_MODEL_<NAME>` | none | Path to an existing model file. |
+| `IM_SEGMENTATION_MODEL_<NAME>` | none | Existing model path. |
 
 Running with `-healthcheck` probes `/health` on the configured port and exits
-with 0 or 1; the container image uses this for its health check.
-
-The face detection cascade is embedded in the binary; a `facefinder` file in
-the working directory takes precedence.
+with 0 or 1. The HTTP server has read-header, read, write, idle, and graceful
+shutdown timeouts.
 
 ## 8. Security notes
 
-- `url`, and the overlay of `Composite` and `Append`, cause server-side fetches.
-  `IM_ALLOWED_HOSTS` bounds them and defaults to loopback, so a fresh
-  deployment is not an open proxy. Widening it to `*` restores the SSRF
-  surface.
-- TLS verification is on unless `IM_INSECURE_TLS=true`.
-- Uploads are unauthenticated and served back verbatim. Disable the endpoint at
-  the ingress, or put authentication in front of it, if that is not acceptable.
-- There is no rate limiting. Background removal and AVIF encoding are expensive,
-  so an unauthenticated public deployment should sit behind a cache and a
-  request limit.
+- Network fetching and uploads are disabled by default.
+- Redirect validation, DNS pinning, private-address rejection, source-byte and
+  pixel limits, output geometry limits, bounded transformation chains, and a
+  processing semaphore are enforced by the application.
+- Upload and derivative directories have byte quotas. Uploads expire; demo mode
+  also removes cache/upload artifacts older than 90 minutes on a 90-minute
+  schedule. Segmentation models are retained.
+- `IM_ALLOWED_HOSTS=*` still allows every public origin. Combining it with
+  `IM_ALLOW_PRIVATE_NETWORKS=true` recreates a broad SSRF surface.
+- An allowed self-host must use `IM_ALLOWED_PATH_PREFIXES` to exclude `/process`
+  and prevent recursive source requests.
+- Public deployments still require edge rate limiting and storage/resource
+  limits. `deploy/kubernetes.yaml` supplies ingress limits, pod bounds, and a
+  private-network-denying egress policy for the public demo.

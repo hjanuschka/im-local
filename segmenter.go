@@ -159,7 +159,8 @@ func (s *segmenter) modelPath(spec modelSpec) (string, error) {
 	}
 	defer os.Remove(temporary.Name())
 
-	written, err := io.Copy(temporary, response.Body)
+	const maxModelBytes = int64(512 << 20)
+	written, err := io.Copy(temporary, io.LimitReader(response.Body, maxModelBytes+1))
 	if closeErr := temporary.Close(); err == nil {
 		err = closeErr
 	}
@@ -168,6 +169,9 @@ func (s *segmenter) modelPath(spec modelSpec) (string, error) {
 	}
 	if written < 1<<20 {
 		return "", fmt.Errorf("downloaded model %s is only %d bytes", spec.Name, written)
+	}
+	if written > maxModelBytes {
+		return "", fmt.Errorf("downloaded model %s exceeds %d bytes", spec.Name, maxModelBytes)
 	}
 	if err := os.Rename(temporary.Name(), path); err != nil {
 		return "", err

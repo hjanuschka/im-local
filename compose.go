@@ -20,7 +20,7 @@ func (ip *ImageProcessor) fetchImage(rawURL string) (image.Image, string, error)
 		return nil, "", err
 	}
 
-	response, err := newHTTPClient(ip.config.InsecureTLS).Get(parsed.String())
+	response, err := ip.sourceClient.Get(parsed.String())
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to fetch image: %w", err)
 	}
@@ -30,9 +30,19 @@ func (ip *ImageProcessor) fetchImage(rawURL string) (image.Image, string, error)
 		return nil, "", fmt.Errorf("failed to fetch image: %s", response.Status)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(response.Body, ip.config.MaxImageBytes))
+	data, err := io.ReadAll(io.LimitReader(response.Body, ip.config.MaxImageBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read image data: %w", err)
+	}
+	if int64(len(data)) > ip.config.MaxImageBytes {
+		return nil, "", fmt.Errorf("source image exceeds %d bytes", ip.config.MaxImageBytes)
+	}
+	decodedConfig, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to inspect image: %w", err)
+	}
+	if err := ip.validateInputConfig(decodedConfig); err != nil {
+		return nil, "", err
 	}
 
 	img, format, err := image.Decode(bytes.NewReader(data))
@@ -64,10 +74,24 @@ func (ip *ImageProcessor) composeRemote(img image.Image, item transformation) (i
 	}
 
 	if scale := item.number(1, "scale"); scale != 1 && scale > 0 {
-		overlay = imaging.Resize(overlay, max(1, int(float64(overlay.Bounds().Dx())*scale)), 0, imaging.Lanczos)
+		width := max(1, int(float64(overlay.Bounds().Dx())*scale))
+		height := max(1, int(float64(overlay.Bounds().Dy())*scale))
+		if err := validateDimensions(width, height, ip.config.MaxDimension, ip.config.MaxOutputPixels); err != nil {
+			return nil, err
+		}
+		overlay = imaging.Resize(overlay, width, height, imaging.Lanczos)
 	}
 
 	if item.Name == "append" {
+		vertical := strings.Contains(normalizeName(item.arg("gravity")), "north") || strings.Contains(normalizeName(item.arg("gravity")), "south") ||
+			normalizeName(item.arg("gravity")) == "vertical" || normalizeName(item.arg("gravity")) == "top" || normalizeName(item.arg("gravity")) == "bottom"
+		width, height := img.Bounds().Dx()+overlay.Bounds().Dx(), max(img.Bounds().Dy(), overlay.Bounds().Dy())
+		if vertical {
+			width, height = max(img.Bounds().Dx(), overlay.Bounds().Dx()), img.Bounds().Dy()+overlay.Bounds().Dy()
+		}
+		if err := validateDimensions(width, height, ip.config.MaxDimension, ip.config.MaxOutputPixels); err != nil {
+			return nil, err
+		}
 		return appendImages(img, overlay, normalizeName(item.arg("gravity"))), nil
 	}
 	return compositeImages(img, overlay, item), nil

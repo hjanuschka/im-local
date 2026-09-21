@@ -9,7 +9,12 @@ background removal runs locally.
 ## Running
 
 ```bash
-go build -o image-processor . && ./image-processor   # listens on :8080
+go build -o image-processor .
+IM_ALLOWED_HOSTS=localhost \
+IM_ALLOW_PRIVATE_NETWORKS=true \
+IM_UPLOADS_ENABLED=true \
+DEMO_MODE=1 \
+./image-processor   # listens on :8080
 ```
 
 Endpoints:
@@ -213,41 +218,81 @@ and product shots, not busy scenes. Arguments: `tolerance` (0.12), `feather`
 
 ## Configuration
 
-Everything is set through the environment.
+Network fetching and uploads both fail closed: neither is enabled by default.
+Everything is configured through the environment.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `IM_PORT` | `8080` | Listen port. |
-| `IM_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Comma separated list of source hosts. `*` allows everything, `*.example.com` allows subdomains. |
+| `IM_ALLOWED_HOSTS` | empty | Comma-separated source hosts. `*` permits public hosts only; `*.example.com` includes the base domain. |
+| `IM_ALLOWED_PATH_PREFIXES` | empty | Optional source-path allowlist. A trailing `/` permits descendants. |
+| `IM_ALLOW_PRIVATE_NETWORKS` | `false` | Permit loopback/private/link-local source addresses and non-standard ports. Use only for local development. |
+| `IM_INSECURE_TLS` | `false` | Skip source TLS verification. Never use on a public deployment. |
+| `IM_MAX_IMAGE_BYTES` | `16777216` | Maximum compressed source bytes. |
+| `IM_MAX_IMAGE_PIXELS` | `20000000` | Maximum decoded source pixels. |
+| `IM_MAX_OUTPUT_PIXELS` | `25000000` | Maximum derivative pixels. |
+| `IM_MAX_DIMENSION` | `8192` | Maximum width or height. |
+| `IM_MAX_TRANSFORMATIONS` | `20` | Maximum operations, including nested conditionals. |
+| `IM_MAX_QUERY_BYTES` | `16384` | Maximum raw query-string size. |
+| `IM_MAX_CONCURRENT` | `4` | Simultaneous processing requests per instance. |
+| `IM_QUEUE_TIMEOUT` | `5s` | How long excess work waits before HTTP 503. |
+| `IM_UPLOADS_ENABLED` | `false` | Enable `POST /upload`. |
+| `IM_UPLOAD_TOKEN` | empty | Optional bearer token required by `/upload`. |
+| `IM_MAX_UPLOAD_BYTES` | `10485760` | Maximum compressed upload bytes. |
+| `IM_UPLOAD_STORAGE_BYTES` | `536870912` | Upload-directory quota; oldest files are removed first. |
+| `IM_UPLOAD_TTL` | `1h` | Uploaded-file lifetime. |
+| `IM_CACHE_STORAGE_BYTES` | `5368709120` | Cache-directory quota. |
 | `IM_CACHE_DIR` | `./cache` | Derivative cache. |
 | `IM_MODEL_DIR` | `./models` | Segmentation weights. |
 | `IM_UPLOAD_DIR` | `./uploads` | Uploaded pristine images. |
-| `IM_CACHE_TTL` | `24h` | Cache lifetime, any Go duration. |
-| `IM_MAX_IMAGE_BYTES` | `67108864` | Maximum bytes read from an origin. |
-| `IM_INSECURE_TLS` | `false` | Skip certificate verification when fetching sources. |
+| `IM_CACHE_TTL` | `24h` | Cache lifetime. |
+| `DEMO_MODE` | `false` | Every 90 minutes, delete cache/upload artifacts older than 90 minutes. Models remain. |
 | `ONNXRUNTIME_SHARED_LIBRARY` | searched | Path to the onnxruntime library. |
 | `IM_SEGMENTATION_DOWNLOAD` | `1` | `0` disables model downloads. |
 
-**The host allowlist matters.** A service that fetches arbitrary URLs is an
-open proxy and an SSRF vector, so out of the box only loopback sources are
-permitted. Set `IM_ALLOWED_HOSTS` to your own origins before deploying.
+The HTTP client validates every redirect, resolves DNS itself, pins the
+connection to the checked address, and rejects loopback, private, link-local,
+multicast, and unspecified addresses unless private networking is explicitly
+enabled. Source credentials, unsafe path traversal, and non-standard public
+ports are rejected.
+
+If a deployment allows its own hostname, configure
+`IM_ALLOWED_PATH_PREFIXES`; otherwise an attacker could recursively use
+`/process` as its own source. The included public-demo manifest allows only the
+sample and upload paths.
 
 ## Deployment
 
 ```bash
 docker build -t im-local .
-docker run -p 8080:8080 -e IM_ALLOWED_HOSTS='images.example.com' im-local
+docker run -p 8080:8080 \
+  -e IM_ALLOWED_HOSTS='images.example.com' \
+  -e IM_ALLOWED_PATH_PREFIXES='/public-images/' \
+  im-local
 ```
 
-The image ships onnxruntime and the shared codec libraries. Kubernetes
-manifests (Deployment, Service, ConfigMap, PVC for the model cache, HPA, and an
-optional Ingress) are in `deploy/kubernetes.yaml`:
+The image ships onnxruntime and shared codec libraries.
+`deploy/kubernetes.yaml` is configured for `im.januschka.com` and includes TLS,
+ingress request/connection limits, CPU/memory/storage bounds, a maximum of three
+replicas, and an egress NetworkPolicy that blocks private networks. It enables
+anonymous demo uploads, bounds them to 512 MiB, and sets `DEMO_MODE=1`.
 
 ```bash
 kubectl apply -f deploy/kubernetes.yaml
 ```
 
-Adjust `IM_ALLOWED_HOSTS` in the ConfigMap first.
+The NetworkPolicy requires a CNI that enforces NetworkPolicy. The Ingress
+annotations target ingress-nginx, and TLS issuance assumes cert-manager with a
+`letsencrypt-prod` ClusterIssuer. Adapt those pieces to your cluster.
+
+## Security model
+
+The application provides defense in depth, but an expensive public image API
+still needs an edge rate limit. The supplied ingress limits each client to two
+requests per second, a short burst, and ten connections. Keep the hostname and
+path allowlists narrow, never set `IM_ALLOWED_HOSTS=*` together with
+`IM_ALLOW_PRIVATE_NETWORKS=true`, and do not expose anonymous uploads without
+both ingress limits and storage quotas.
 
 ## Caching
 

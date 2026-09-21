@@ -1,9 +1,4 @@
-# im-local: deployment, service, and storage.
-#
-#   kubectl apply -f deploy/kubernetes.yaml
-#
-# Set IM_ALLOWED_HOSTS in the ConfigMap before use: source hosts are denied by
-# default, so the service refuses to fetch anything until it is configured.
+# Public demo deployment for https://im.januschka.com.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,27 +7,28 @@ metadata:
     app.kubernetes.io/name: im-local
 data:
   IM_PORT: "8080"
-  # Comma separated. "*" allows everything, "*.example.com" allows subdomains.
-  IM_ALLOWED_HOSTS: "images.example.com"
-  IM_CACHE_TTL: "24h"
+  # The demo only processes its bundled samples and files uploaded to itself.
+  IM_ALLOWED_HOSTS: "im.januschka.com"
+  IM_ALLOWED_PATH_PREFIXES: "/sample.jpg,/sample-studio.jpg,/uploads/"
+  IM_UPLOADS_ENABLED: "true"
+  DEMO_MODE: "1"
+  IM_CACHE_TTL: "90m"
+  IM_UPLOAD_TTL: "90m"
   IM_CACHE_DIR: "/app/cache"
   IM_MODEL_DIR: "/app/models"
   IM_UPLOAD_DIR: "/app/uploads"
+  IM_MAX_IMAGE_BYTES: "16777216"
+  IM_MAX_IMAGE_PIXELS: "20000000"
+  IM_MAX_OUTPUT_PIXELS: "25000000"
+  IM_MAX_DIMENSION: "8192"
+  IM_MAX_TRANSFORMATIONS: "20"
+  IM_MAX_QUERY_BYTES: "16384"
+  IM_MAX_CONCURRENT: "3"
+  IM_QUEUE_TIMEOUT: "5s"
+  IM_MAX_UPLOAD_BYTES: "10485760"
+  IM_UPLOAD_STORAGE_BYTES: "536870912"
+  IM_CACHE_STORAGE_BYTES: "5368709120"
   GIN_MODE: "release"
----
-# Segmentation weights are downloaded once on first use and are large, so they
-# live on a volume instead of being fetched again after every restart.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: im-local-models
-  labels:
-    app.kubernetes.io/name: im-local
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 2Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -41,7 +37,7 @@ metadata:
   labels:
     app.kubernetes.io/name: im-local
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: im-local
@@ -55,6 +51,7 @@ spec:
       labels:
         app.kubernetes.io/name: im-local
     spec:
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -64,7 +61,7 @@ spec:
       containers:
         - name: im-local
           image: ghcr.io/hjanuschka/im-local:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
@@ -76,10 +73,9 @@ spec:
               cpu: "500m"
               memory: "512Mi"
             limits:
-              # Background removal loads a segmentation model into memory and
-              # image processing is CPU bound.
               cpu: "2"
               memory: "3Gi"
+              ephemeral-storage: "8Gi"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -113,18 +109,20 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
-        # Derivatives are reproducible, so a node-local cache is enough.
+        # All user-created data is ephemeral and bounded. DEMO_MODE also removes
+        # cache and upload artifacts older than 90 minutes from inside the app.
         - name: cache
           emptyDir:
             sizeLimit: 5Gi
         - name: uploads
           emptyDir:
-            sizeLimit: 1Gi
-        - name: tmp
-          emptyDir: {}
+            sizeLimit: 512Mi
         - name: models
-          persistentVolumeClaim:
-            claimName: im-local-models
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
 ---
 apiVersion: v1
 kind: Service
@@ -145,15 +143,20 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: im-local
-  labels:
-    app.kubernetes.io/name: im-local
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: im-local
-  minReplicas: 2
-  maxReplicas: 10
+  minReplicas: 1
+  maxReplicas: 3
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
   metrics:
     - type: Resource
       resource:
@@ -162,7 +165,6 @@ spec:
           type: Utilization
           averageUtilization: 70
 ---
-# Optional. Remove if you terminate traffic elsewhere.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -170,10 +172,21 @@ metadata:
   labels:
     app.kubernetes.io/name: im-local
   annotations:
-    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "11m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/limit-rps: "2"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
 spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["im.januschka.com"]
+      secretName: im-januschka-com-tls
   rules:
-    - host: images.example.com
+    - host: im.januschka.com
       http:
         paths:
           - path: /
@@ -183,3 +196,40 @@ spec:
                 name: im-local
                 port:
                   name: http
+---
+# Permit DNS and public internet HTTPS/HTTP, while denying access to cluster,
+# private, loopback, and link-local networks. Application checks remain active
+# as a second layer and pin connections to the validated DNS answer.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: im-local-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: im-local
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 224.0.0.0/4
+      ports:
+        - {protocol: TCP, port: 80}
+        - {protocol: TCP, port: 443}
