@@ -6,6 +6,8 @@ Self-hosted image transformation service. Transformations are expressed as a
 query-string chain, output formats are negotiated (including JPEG XL), and
 background removal runs locally.
 
+**[Open the live demo at im.januschka.com](https://im.januschka.com/)**
+
 ## Running
 
 ```bash

@@ -391,6 +391,23 @@ func newTestServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(router)
 }
 
+func TestRootRedirectsToDocumentation(t *testing.T) {
+	server := newTestServer(t)
+	defer server.Close()
+
+	client := &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	response, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusTemporaryRedirect || response.Header.Get("Location") != "/doc" {
+		t.Fatalf("root response = %d Location %q", response.StatusCode, response.Header.Get("Location"))
+	}
+}
+
 func TestDocPageListsEveryTransformation(t *testing.T) {
 	server := newTestServer(t)
 	defer server.Close()

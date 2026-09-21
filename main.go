@@ -98,6 +98,9 @@ func NewImageProcessor(config Config) (*ImageProcessor, error) {
 
 // RegisterRoutes wires every endpoint of the service.
 func (ip *ImageProcessor) RegisterRoutes(router gin.IRouter) {
+	router.GET("/", func(c *gin.Context) {
+		c.Redirect(http.StatusTemporaryRedirect, "/doc")
+	})
 	router.GET("/process", ip.HandleRequest)
 
 	// Documentation with a live example per transformation.
