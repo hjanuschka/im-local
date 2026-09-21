@@ -1,0 +1,14 @@
+cache
+impo
+image-processor
+.pi/
+models/
+uploads/
+libjxl.dylib
+libavif.dylib
+libwebp.dylib
+libwebpdemux.dylib
+
+# local sample scratch files
+input.jpg
+output.jpg

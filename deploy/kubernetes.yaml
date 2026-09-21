@@ -1,0 +1,185 @@
+# im-local: deployment, service, and storage.
+#
+#   kubectl apply -f deploy/kubernetes.yaml
+#
+# Set IM_ALLOWED_HOSTS in the ConfigMap before use: source hosts are denied by
+# default, so the service refuses to fetch anything until it is configured.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: im-local
+  labels:
+    app.kubernetes.io/name: im-local
+data:
+  IM_PORT: "8080"
+  # Comma separated. "*" allows everything, "*.example.com" allows subdomains.
+  IM_ALLOWED_HOSTS: "images.example.com"
+  IM_CACHE_TTL: "24h"
+  IM_CACHE_DIR: "/app/cache"
+  IM_MODEL_DIR: "/app/models"
+  IM_UPLOAD_DIR: "/app/uploads"
+  GIN_MODE: "release"
+---
+# Segmentation weights are downloaded once on first use and are large, so they
+# live on a volume instead of being fetched again after every restart.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: im-local-models
+  labels:
+    app.kubernetes.io/name: im-local
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: im-local
+  labels:
+    app.kubernetes.io/name: im-local
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: im-local
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: im-local
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: im-local
+          image: ghcr.io/hjanuschka/im-local:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: im-local
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              # Background removal loads a segmentation model into memory and
+              # image processing is CPU bound.
+              cpu: "2"
+              memory: "3Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          volumeMounts:
+            - name: cache
+              mountPath: /app/cache
+            - name: uploads
+              mountPath: /app/uploads
+            - name: models
+              mountPath: /app/models
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Derivatives are reproducible, so a node-local cache is enough.
+        - name: cache
+          emptyDir:
+            sizeLimit: 5Gi
+        - name: uploads
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir: {}
+        - name: models
+          persistentVolumeClaim:
+            claimName: im-local-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-local
+  labels:
+    app.kubernetes.io/name: im-local
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: im-local
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: im-local
+  labels:
+    app.kubernetes.io/name: im-local
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: im-local
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# Optional. Remove if you terminate traffic elsewhere.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: im-local
+  labels:
+    app.kubernetes.io/name: im-local
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+spec:
+  rules:
+    - host: images.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: im-local
+                port:
+                  name: http
